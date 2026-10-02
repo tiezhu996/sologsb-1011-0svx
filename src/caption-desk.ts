@@ -1,19 +1,34 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
-  applyRules,
+  acceptReconciliation,
+  buildTermSnapshot,
   cloneModel,
   createInitialModel,
+  discardCheckpoint,
+  importTermPackage,
+  latestPackage,
+  loadStoredModel,
   mergeConfirmedSegments,
   normalizeNumbers,
   queueStats,
+  reconciliationReport,
+  renderWithRules,
+  retryCheckpoint,
   STORAGE_KEY,
   simulateLatency,
   toSrt,
+  SAMPLE_PACKAGE_V2,
+  SAMPLE_PACKAGE_V3_CONFLICT,
+  effectiveRules,
   type CaptionSegment,
   type ConnectionState,
   type DeskModel,
+  type ImportResult,
+  type ReconcileItem,
+  type ReconcileStatus,
   type SegmentState,
+  type TermPackage,
   type ToastMessage,
 } from './model';
 
@@ -221,6 +236,64 @@ export class CaptionDesk extends LitElement {
     .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 20; width: 380px; display: flex; flex-direction: column; gap: 8px; }
     cds-toast-notification { box-shadow: 0 8px 22px rgba(0,0,0,.18); }
 
+    /* ---- 术语版本对账 ---- */
+    .version-banner { margin: 0; padding: 9px 12px; background: #edf5ff; border-bottom: 1px solid #78a9ff; color: #0043ce; font-size: 10px; line-height: 1.5; }
+    .version-banner small { display: block; color: #525252; margin-top: 2px; }
+    .pkg-list { padding: 4px 0; max-height: 170px; overflow: auto; }
+    .pkg-item { padding: 8px 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+    .pkg-item.active { background: #edf5ff; }
+    .pkg-ver { font: 600 11px/1.2 "IBM Plex Mono", monospace; color: #0f62fe; }
+    .pkg-item p { margin: 2px 0 0; font-size: 10px; color: var(--cds-text-secondary, #525252); line-height: 1.4; }
+    .pkg-badge { font-size: 9px; padding: 2px 6px; border: 1px solid #42be65; color: #198038; white-space: nowrap; }
+    .import-drop { margin: 10px; padding: 14px; border: 1px dashed #8d8d8d; text-align: center; font-size: 10px; color: var(--cds-text-secondary, #525252); cursor: pointer; line-height: 1.6; }
+    .import-drop.dragging { border-color: #0f62fe; background: #edf5ff; color: #0043ce; }
+    .import-drop strong { display: block; color: var(--cds-text-primary, #161616); font-size: 11px; }
+    .import-actions { display: flex; gap: 6px; padding: 0 10px 10px; flex-wrap: wrap; }
+    .import-textarea { margin: 0 10px 10px; }
+    .import-textarea textarea { width: 100%; min-height: 90px; font: 10px/1.5 "IBM Plex Mono", monospace; }
+
+    .checkpoint-item { margin: 8px 10px; padding: 9px 10px; background: #fff1f1; border-left: 3px solid #fa4d56; font-size: 10px; line-height: 1.5; }
+    .checkpoint-item.resolved { background: #defbe6; border-left-color: #42be65; }
+    .checkpoint-item strong { display: block; font-size: 11px; margin-bottom: 3px; }
+    .checkpoint-item ul { margin: 5px 0; padding-left: 16px; color: #a2191f; }
+    .checkpoint-item.resolved ul { color: #198038; }
+    .checkpoint-actions { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+
+    .reconcile-summary { padding: 8px 12px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); font-size: 10px; text-align: center; }
+    .reconcile-summary b { display: block; font-size: 14px; font-weight: 400; font-variant-numeric: tabular-nums; }
+    .reconcile-summary .n-clean b { color: #198038; }
+    .reconcile-summary .n-manual b { color: #0f62fe; }
+    .reconcile-summary .n-conflict b { color: #da1e28; }
+    .reconcile-list { max-height: 320px; overflow: auto; padding: 4px 0; }
+    .reconcile-item { padding: 8px 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); }
+    .reconcile-item.conflict { background: #fff1f1; }
+    .reconcile-item.manual-preserved { background: #f4f8ff; }
+    .reconcile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10px; margin-bottom: 5px; }
+    .reconcile-head b { font: 500 10px/1 "IBM Plex Mono", monospace; color: var(--cds-text-secondary); }
+    .status-pill { font-size: 9px; padding: 2px 7px; white-space: nowrap; }
+    .status-pill.clean { background: #defbe6; color: #198038; }
+    .status-pill.manual-preserved { background: #edf5ff; color: #0043ce; }
+    .status-pill.conflict { background: #ffd7d9; color: #a2191f; }
+    .status-pill.up-to-date, .status-pill.pending-segment { background: #e8e8e8; color: #525252; }
+    .reconcile-text { margin: 0 0 4px; font-size: calc(var(--caption-font-size) * .78); line-height: 1.5; }
+    .reconcile-text .tok-changed { background: #d7f3df; border-radius: 2px; padding: 0 1px; }
+    .reconcile-text .tok-conflict { background: #ffd7d9; border-bottom: 2px wavy #da1e28; border-radius: 2px; padding: 0 1px; cursor: help; }
+    .reconcile-aired { margin: 3px 0 0; font-size: 9px; color: var(--cds-text-secondary, #525252); line-height: 1.45; }
+    .reconcile-aired s { opacity: .7; }
+    .reconcile-msg { margin: 4px 0 0; font-size: 9px; color: var(--cds-text-secondary); }
+    .reconcile-actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+    .reconcile-editor { width: 100%; margin-top: 5px; }
+    .reconcile-editor textarea { width: 100%; min-height: 48px; font-size: 11px; line-height: 1.5; }
+
+    .playback-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); flex-wrap: wrap; }
+    .playback-bar small { font-size: 10px; color: var(--cds-text-secondary); }
+    .playback-list { max-height: 240px; overflow: auto; }
+    .playback-item { padding: 7px 12px; border-bottom: 1px solid var(--cds-border-subtle, #e0e0e0); font-size: calc(var(--caption-font-size) * .78); line-height: 1.45; }
+    .playback-item time { display: block; font: 500 9px/1.4 "IBM Plex Mono", monospace; color: #6f6f6f; }
+    .playback-item.conflict { background: #fff1f1; }
+    .playback-item .ver { float: right; font-size: 9px; color: #0f62fe; }
+    .playback-note { padding: 7px 12px; font-size: 9px; color: #684e00; background: #fff8e1; border-left: 2px solid #f1c21b; line-height: 1.5; }
+
     @media (max-width: 1280px) {
       .workspace { grid-template-columns: minmax(340px, .85fr) minmax(410px, 1fr) minmax(330px, .85fr); }
       .status-strip { grid-template-columns: 1.4fr repeat(4, minmax(100px, .55fr)); }
@@ -246,6 +319,16 @@ export class CaptionDesk extends LitElement {
   @state() private ruleSpeaker = '';
   @state() private filter: 'active' | 'all' | 'attention' = 'active';
   @state() private showRuleForm = false;
+  // 术语包导入
+  @state() private showImportPanel = false;
+  @state() private importText = '';
+  @state() private importDragging = false;
+  // 对账目标版本（默认当前生效版本的下一候选；否则为当前版本）
+  @state() private reconcileVersion = '';
+  @state() private reconcilingId = '';
+  @state() private reconcileDraft = '';
+  // 回放预览模式：aired=各段确认版本；否则为目标版本号
+  @state() private playbackMode: string = 'aired';
   private past: DeskModel[] = [];
   private future: DeskModel[] = [];
   private ticker?: number;
@@ -269,16 +352,7 @@ export class CaptionDesk extends LitElement {
   }
 
   private loadModel(): DeskModel {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as DeskModel;
-        if (parsed.segments?.length) return parsed;
-      }
-    } catch {
-      // 损坏草稿会回退到演示数据。
-    }
-    return createInitialModel();
+    return loadStoredModel() ?? createInitialModel();
   }
 
   private persist(): void {
@@ -365,7 +439,7 @@ export class CaptionDesk extends LitElement {
 
   private applyTerm(ruleId: string): void {
     const selected = this.selected;
-    const rule = this.model.rules.find((item) => item.id === ruleId);
+    const rule = this.findRule(ruleId);
     if (!selected || !rule) return;
     const flags = rule.caseSensitive ? 'g' : 'gi';
     const expression = new RegExp(rule.source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
@@ -375,9 +449,16 @@ export class CaptionDesk extends LitElement {
     }
     this.commit('应用术语替换', (current) => ({
       ...current,
+      // usageCount 只统计本机叠加层规则；术语包规则是只读事实，计数不被对账/应用改动。
       rules: current.rules.map((item) => item.id === rule.id ? { ...item, usageCount: item.usageCount + 1 } : item),
       segments: current.segments.map((item) => item.id === selected.id ? { ...item, corrected: item.corrected.replace(expression, rule.replacement), revision: item.revision + 1 } : item),
     }));
+  }
+
+  /** 在「当前版本生效规则 = 术语包 + 本机叠加层」中查找规则。 */
+  private findRule(id: string) {
+    return effectiveRules(this.model, this.model.activeTermVersion).find((item) => item.id === id)
+      ?? this.model.rules.find((item) => item.id === id);
   }
 
   private applyInlineEdit(transform: (value: string) => string, label: string, cursorShift = 0): void {
@@ -436,25 +517,35 @@ export class CaptionDesk extends LitElement {
       this.pushToast('warning', '没有可确认的片段', '请先从待确认区选择字幕');
       return;
     }
-    const { text, used } = applyRules(selected.corrected, this.model);
     const offline = this.model.connection === 'offline';
+    const version = this.model.activeTermVersion;
+    // 确认瞬间：草稿 = 人工编辑框内容；播出文本 = 对草稿应用当前版本规则；并锁定版本快照。
+    const draft = selected.corrected;
+    const used = renderWithRules(draft, effectiveRules(this.model, version), selected.speaker).used;
     const nextOrder = this.pendingSegments.filter((item) => item.id !== selected.id);
-    this.commit('确认并送入直播区', (current) => ({
-      ...current,
-      segments: current.segments.map((item) => item.id === selected.id ? {
-        ...item,
-        corrected: text,
-        state: 'confirmed',
-        source: offline ? 'offline' : item.source,
-        confirmedAt: Date.now(),
-        staleReason: item.state === 'stale' ? item.staleReason : undefined,
-        tags: used.length ? [...new Set([...item.tags, '术语已应用'])] : item.tags,
-        revision: item.revision + 1,
-      } : item),
-      rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
-      selectedId: nextOrder[0]?.id ?? selected.id,
-    }));
-    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认`);
+    this.commit('确认并送入直播区', (current) => {
+      const currentVersion = current.activeTermVersion;
+      const currentRendered = renderWithRules(draft, effectiveRules(current, currentVersion), selected.speaker);
+      const currentSnapshot = buildTermSnapshot(selected.original, draft, currentRendered.text, current, selected.speaker);
+      return {
+        ...current,
+        segments: current.segments.map((item) => item.id === selected.id ? {
+          ...item,
+          corrected: currentRendered.text,
+          state: 'confirmed',
+          source: offline ? 'offline' : item.source,
+          confirmedAt: Date.now(),
+          staleReason: item.state === 'stale' ? item.staleReason : undefined,
+          tags: used.length ? [...new Set([...item.tags, `术语已应用@${currentVersion}`])] : item.tags,
+          term: currentSnapshot,
+          reconciled: undefined,
+          revision: item.revision + 1,
+        } : item),
+        rules: current.rules.map((rule) => used.includes(rule.id) ? { ...rule, usageCount: rule.usageCount + 1 } : rule),
+        selectedId: nextOrder[0]?.id ?? selected.id,
+      };
+    });
+    this.pushToast(offline ? 'warning' : 'success', offline ? '已加入离线发件箱' : '字幕已进入直播区', offline ? '恢复连接后将按时间顺序合并' : `第 ${selected.sequence} 段已确认并锁定术语 ${version}`);
   }
 
   private ignoreSelected(): void {
@@ -514,7 +605,7 @@ export class CaptionDesk extends LitElement {
     this.commit('新增术语快捷规则', (current) => ({
       ...current,
       rules: [{
-        id: `term-${Date.now().toString(36)}`,
+        id: `local-${Date.now().toString(36)}`,
         source,
         replacement,
         speaker: this.ruleSpeaker,
@@ -522,6 +613,7 @@ export class CaptionDesk extends LitElement {
         caseSensitive: false,
         usageCount: 0,
         createdAt: Date.now(),
+        local: true,
       }, ...current.rules],
     }));
     this.ruleSource = '';
@@ -531,11 +623,155 @@ export class CaptionDesk extends LitElement {
   }
 
   private deleteRule(id: string): void {
-    this.commit('删除术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
+    const rule = this.model.rules.find((item) => item.id === id);
+    if (!rule?.local) {
+      this.pushToast('warning', '术语包规则不可删除', '术语包只提供规则事实；本机快捷规则才能删除');
+      return;
+    }
+    this.commit('删除本机术语规则', (current) => ({ ...current, rules: current.rules.filter((item) => item.id !== id) }));
   }
 
-  private exportSrt(): void {
-    const content = toSrt(this.model);
+  // -------------------------------------------------------------------------
+  // 术语包导入（整包原子：失败留检查点，重试不重复应用）
+  // -------------------------------------------------------------------------
+
+  private get packages(): TermPackage[] {
+    return this.model.termPackages;
+  }
+
+  private get activePackage(): TermPackage | undefined {
+    return this.packages.find((item) => item.version === this.model.activeTermVersion) ?? latestPackage(this.packages);
+  }
+
+  private openImportSample(pkg: TermPackage): void {
+    this.showImportPanel = true;
+    this.importText = JSON.stringify(pkg, null, 2);
+  }
+
+  private handleImportFile(file: File): void {
+    const reader = new FileReader();
+    reader.onload = () => {
+      this.importText = String(reader.result ?? '');
+      this.showImportPanel = true;
+    };
+    reader.readAsText(file);
+  }
+
+  private onImportDrop(event: DragEvent): void {
+    event.preventDefault();
+    this.importDragging = false;
+    const file = event.dataTransfer?.files?.[0];
+    if (file) this.handleImportFile(file);
+  }
+
+  private doImport(): void {
+    if (!this.importText.trim()) {
+      this.pushToast('warning', '导入内容为空', '粘贴术语包 JSON，或拖入 .json 文件');
+      return;
+    }
+    const { model: next, result } = importTermPackage(this.model, this.importText);
+    this.applyImportResult(next, result);
+  }
+
+  private doRetryCheckpoint(id: string): void {
+    const { model: next, result } = retryCheckpoint(this.model, id);
+    this.applyImportResult(next, result);
+  }
+
+  private applyImportResult(next: DeskModel, result: ImportResult): void {
+    this.past = [...this.past, cloneModel(this.model)].slice(-HISTORY_LIMIT);
+    this.future = [];
+    this.model = next;
+    this.persist();
+    if (result.ok) {
+      this.reconcileVersion = result.version ?? this.model.activeTermVersion;
+      this.pushToast('success', `术语包 ${result.version} 已整包生效`, result.message);
+    } else if (result.checkpoint) {
+      this.pushToast('error', `术语包 ${result.checkpoint.version} 导入失败`, `已保留检查点 · ${result.conflicts.length} 项冲突，规则未应用`);
+    } else {
+      this.pushToast('info', '术语包未应用', result.message);
+    }
+  }
+
+  private doDiscardCheckpoint(id: string): void {
+    this.commit('丢弃导入检查点', (current) => discardCheckpoint(current, id));
+  }
+
+  private editCheckpointRaw(id: string): void {
+    const checkpoint = this.model.importCheckpoints.find((item) => item.id === id);
+    if (!checkpoint) return;
+    this.showImportPanel = true;
+    this.importText = checkpoint.raw;
+    // 把编辑中的文本写回检查点，再点“整包导入”即等价于修复后重试。
+    this.commit('载入检查点到编辑器', (current) => ({
+      ...current,
+      importCheckpoints: current.importCheckpoints.map((item) => item.id === id ? { ...item, raw: this.importText } : item),
+    }));
+    this.pushToast('info', '可在下方修复后重试', '修复 JSON 后点击“整包导入”，成功将复用同一检查点且不会重复应用');
+  }
+
+  // -------------------------------------------------------------------------
+  // 版本对账
+  // -------------------------------------------------------------------------
+
+  private get targetReconcileVersion(): string {
+    const candidates = this.packages.map((item) => item.version);
+    const current = this.model.activeTermVersion;
+    const stored = this.reconcileVersion;
+    if (stored && candidates.includes(stored)) return stored;
+    const newer = candidates.filter((version) => version !== current).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))[0];
+    return newer ?? current;
+  }
+
+  private get reconcileItems(): ReconcileItem[] {
+    return reconciliationReport(this.model, this.targetReconcileVersion);
+  }
+
+  private get reconcileSummary() {
+    const items = this.reconcileItems;
+    return {
+      clean: items.filter((item) => item.status === 'clean').length,
+      manual: items.filter((item) => item.status === 'manual-preserved').length,
+      conflict: items.filter((item) => item.status === 'conflict').length,
+      pinned: items.filter((item) => item.status === 'up-to-date').length,
+    };
+  }
+
+  private beginResolve(item: ReconcileItem): void {
+    this.reconcilingId = item.segment.id;
+    this.reconcileDraft = item.proposed ?? item.segment.corrected;
+  }
+
+  private cancelResolve(): void {
+    this.reconcilingId = '';
+    this.reconcileDraft = '';
+  }
+
+  private acceptItem(item: ReconcileItem, override?: string): void {
+    const text = override ?? item.proposed ?? item.segment.corrected;
+    const status: ReconcileStatus = item.status === 'clean' ? 'clean' : 'manual-preserved';
+    this.commit('接受版本对账结果（已播文本不变）', (current) =>
+      acceptReconciliation(current, item.segment.id, this.targetReconcileVersion, text, status, item.message));
+    this.cancelResolve();
+  }
+
+  private acceptAllSafe(): void {
+    const actionable = this.reconcileItems.filter((item) => item.status === 'clean' || item.status === 'manual-preserved');
+    if (!actionable.length) {
+      this.pushToast('info', '没有可批量接受的段落', '冲突段落需要逐条人工裁决');
+      return;
+    }
+    this.commit(`批量接受 ${actionable.length} 段对账结果`, (current) => {
+      let next = current;
+      for (const item of actionable) {
+        next = acceptReconciliation(next, item.segment.id, this.targetReconcileVersion, item.proposed ?? item.segment.corrected, item.status, item.message);
+      }
+      return next;
+    });
+  }
+
+  private exportSrt(mode: string): void {
+    const { content, count, conflicts } = toSrt(this.model, mode);
     if (!content) {
       this.pushToast('warning', '暂无已确认字幕', '先确认至少一个片段再导出');
       return;
@@ -544,10 +780,19 @@ export class CaptionDesk extends LitElement {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${this.model.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}.srt`;
+    const suffix = mode === 'aired' ? '播出确认版' : `术语${mode}`;
+    anchor.download = `${this.model.eventName.replace(/[^\p{L}\p{N}-]+/gu, '-')}-${suffix}.srt`;
     anchor.click();
     URL.revokeObjectURL(url);
-    this.pushToast('success', 'SRT 已导出', `${toSrt(this.model).split('\n\n').length} 段字幕`);
+    if (mode === 'aired') {
+      this.pushToast('success', '已按各段确认版本导出 SRT', `${count} 段；已播字幕未被新版本规则改写`);
+    } else {
+      this.pushToast(
+        conflicts.length ? 'warning' : 'success',
+        `已按术语 ${mode} 导出 SRT`,
+        conflicts.length ? `${count} 段，其中 ${conflicts.length} 段存在人工冲突，已回退保留人工播出文本` : `${count} 段`,
+      );
+    }
   }
 
   private adjustFont(delta: number): void {
@@ -628,7 +873,8 @@ export class CaptionDesk extends LitElement {
     if (!item) {
       return html`<div class="empty"><strong>选择一条待确认字幕</strong><p>可以使用 Alt+J / Alt+K 在片段之间移动。</p></div>`;
     }
-    const applicableRules = this.model.rules.filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
+    const applicableRules = effectiveRules(this.model, this.model.activeTermVersion)
+      .filter((rule) => rule.enabled && (!rule.speaker || rule.speaker === item.speaker));
     return html`
       <div class="editor-scroll">
         <div class="editor-card">
@@ -640,6 +886,9 @@ export class CaptionDesk extends LitElement {
             <div class="editor-status">
               <cds-tag type=${item.state === 'stale' ? 'warm-gray' : item.state === 'duplicate' ? 'purple' : 'blue'} size="sm">${stateLabel(item.state)}</cds-tag>
               <cds-tag type="outline" size="sm">修改 ${item.revision} 次</cds-tag>
+              ${item.term
+                ? html`<cds-tag type="green" size="sm">术语 v${item.term.version} 已锁定${item.term.manual ? ' · 含人工修改' : ''}</cds-tag>`
+                : html`<cds-tag type="cyan" size="sm">确认将锁定 v${this.model.activeTermVersion}</cds-tag>`}
             </div>
           </div>
           <div class="editor-form">
@@ -693,72 +942,313 @@ export class CaptionDesk extends LitElement {
     `;
   }
 
-  private renderInspector() {
+  // ----- 对账状态文案 -----
+  private reconcileStatusLabel(status: ReconcileStatus): string {
+    return {
+      'up-to-date': '已最新',
+      clean: '干净升级',
+      'manual-preserved': '人工保留',
+      conflict: '冲突待裁决',
+      'pending-segment': '未确认',
+    }[status];
+  }
+
+  private renderTokens(item: ReconcileItem) {
+    if (!item.tokens) return html`${item.proposed ?? ''}`;
+    return item.tokens.map((token) => {
+      if (token.status === 'unchanged') return html`${token.text}`;
+      if (token.status === 'conflict') {
+        return html`<span class="tok-conflict" title=${`新版本建议：${token.to ?? ''}（已保留人工播出文本）`}>${token.text}</span>`;
+      }
+      return html`<span class="tok-changed">${token.text}</span>`;
+    });
+  }
+
+  private renderTermVersions() {
+    const active = this.activePackage;
+    const items = [...this.packages].sort((a, b) => b.releasedAt - a.releasedAt);
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>术语版本</h3>
+          <span>当前生效 v${this.model.activeTermVersion}</span>
+        </div>
+        ${active ? html`
+          <div class="version-banner">
+            <strong>v${active.version}</strong> · ${active.note || '术语包规则事实'}
+            <small>${active.rules.length} 条规则 · 导入于 ${new Date(active.importedAt ?? active.releasedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · 直播中途下发的新版本不会改写已播字幕</small>
+          </div>` : nothing}
+        <div class="pkg-list">
+          ${items.map((pkg) => html`
+            <div class="pkg-item ${pkg.version === this.model.activeTermVersion ? 'active' : ''}">
+              <span class="pkg-ver">v${pkg.version}</span>
+              <p>${pkg.note || '术语包'}<br/>${pkg.rules.length} 条规则事实</p>
+              ${pkg.version === this.model.activeTermVersion ? html`<span class="pkg-badge">生效中</span>` : nothing}
+            </div>
+          `)}
+        </div>
+
+        <div
+          class="import-drop ${this.importDragging ? 'dragging' : ''}"
+          @dragover=${(event: DragEvent) => { event.preventDefault(); this.importDragging = true; }}
+          @dragleave=${() => { this.importDragging = false; }}
+          @drop=${(event: DragEvent) => this.onImportDrop(event)}
+          @click=${() => { this.showImportPanel = !this.showImportPanel; }}
+        >
+          <strong>导入带版本号的术语包</strong>
+          拖入 .json 或点击粘贴 · 整包原子校验，失败会留下检查点
+        </div>
+        <div class="import-actions">
+          <cds-button kind="ghost" size="sm" @click=${() => this.openImportSample(SAMPLE_PACKAGE_V2)}>示例：干净升级 v2.0.0</cds-button>
+          <cds-button kind="ghost" size="sm" @click=${() => this.openImportSample(SAMPLE_PACKAGE_V3_CONFLICT)}>示例：冲突包 v3.0.0</cds-button>
+        </div>
+        ${this.showImportPanel ? html`
+          <div class="import-textarea">
+            <textarea
+              .value=${this.importText}
+              placeholder='{"version":"2.0.0","rules":[...]}'
+              @input=${(event: Event) => { this.importText = (event.target as HTMLTextAreaElement).value; }}
+            ></textarea>
+          </div>
+          <div class="import-actions">
+            <cds-button kind="primary" size="sm" @click=${this.doImport}>整包导入</cds-button>
+            <cds-button kind="ghost" size="sm" @click=${() => { this.showImportPanel = false; this.importText = ''; }}>取消</cds-button>
+          </div>
+        ` : nothing}
+        ${this.renderCheckpoints()}
+      </section>
+    `;
+  }
+
+  private renderCheckpoints() {
+    const checkpoints = this.model.importCheckpoints;
+    if (!checkpoints.length) return nothing;
+    return html`
+      <div style="padding: 4px 10px 8px;">
+        <strong style="font-size:11px;">导入检查点（${checkpoints.length}）</strong>
+        ${checkpoints.map((checkpoint) => html`
+          <div class="checkpoint-item ${checkpoint.resolved ? 'resolved' : ''}">
+            <strong>v${checkpoint.version} ${checkpoint.resolved ? '· 已修复并成功导入' : `· 整包失败（${checkpoint.attempts} 次尝试）`}</strong>
+            <div>${checkpoint.reason}</div>
+            <ul>
+              ${checkpoint.conflicts.slice(0, 5).map((conflict) => html`<li>${conflict.message}</li>`)}
+            </ul>
+            <div class="checkpoint-actions">
+              ${checkpoint.resolved
+                ? html`<small style="font-size:9px;color:#198038;">重试不会重复应用，版本仅生效一次</small>`
+                : html`
+                  <cds-button kind="primary" size="sm" @click=${() => this.doRetryCheckpoint(checkpoint.id)}>原样重试</cds-button>
+                  <cds-button kind="tertiary" size="sm" @click=${() => this.editCheckpointRaw(checkpoint.id)}>修复后重试</cds-button>
+                  <cds-button kind="danger--ghost" size="sm" @click=${() => this.doDiscardCheckpoint(checkpoint.id)}>丢弃</cds-button>
+                `}
+            </div>
+          </div>
+        `)}
+      </div>
+    `;
+  }
+
+  private renderReconciliation() {
+    const versionOptions = this.packages.map((pkg) => pkg.version);
+    const target = this.targetReconcileVersion;
+    const items = this.reconcileItems;
+    const summary = this.reconcileSummary;
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>术语版本对账</h3>
+          <span>${items.length} 段已确认</span>
+        </div>
+        <div class="playback-bar">
+          <small>对账目标版本</small>
+          <cds-dropdown size="sm" value=${target} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.reconcileVersion = event.detail.item.value; this.cancelResolve(); }} style="width: 130px;">
+            ${versionOptions.map((version) => html`<cds-dropdown-item value=${version}>v${version}</cds-dropdown-item>`)}
+          </cds-dropdown>
+          <cds-button kind="tertiary" size="sm" ?disabled=${summary.conflict > 0} @click=${this.acceptAllSafe}>接受全部无冲突项</cds-button>
+        </div>
+        <div class="reconcile-summary">
+          <div class="n-clean"><b>${summary.clean}</b><span>干净升级</span></div>
+          <div class="n-manual"><b>${summary.manual}</b><span>人工保留</span></div>
+          <div class="n-conflict"><b>${summary.conflict}</b><span>冲突</span></div>
+          <div><b>${summary.pinned}</b><span>已最新</span></div>
+        </div>
+        <div class="reconcile-list">
+          ${items.map((item) => this.renderReconcileItem(item))}
+        </div>
+        <div class="playback-note">对账只生成建议与接受记录；每段的已播文本（corrected）永不改写，直播/导出仍按各段确认版本取字幕。</div>
+      </section>
+    `;
+  }
+
+  private renderReconcileItem(item: ReconcileItem) {
+    const segment = item.segment;
+    const locked = segment.term?.version ?? '—';
+    const editing = this.reconcilingId === segment.id;
+    return html`
+      <div class="reconcile-item ${item.status}">
+        <div class="reconcile-head">
+          <b>#${String(segment.sequence).padStart(3, '0')} · v${locked} → v${item.targetVersion}</b>
+          <span class="status-pill ${item.status}">${this.reconcileStatusLabel(item.status)}</span>
+        </div>
+        ${item.status === 'up-to-date'
+          ? html`<p class="reconcile-msg">${item.message}</p>`
+          : html`
+            <p class="reconcile-text">${this.renderTokens(item)}</p>
+            <p class="reconcile-aired">已播冻结：<s>${segment.corrected}</s></p>
+            <p class="reconcile-msg">${item.message}</p>
+            ${editing ? html`
+              <div class="reconcile-editor">
+                <textarea .value=${this.reconcileDraft} @input=${(event: Event) => { this.reconcileDraft = (event.target as HTMLTextAreaElement).value; }}></textarea>
+              </div>
+              <div class="reconcile-actions">
+                <cds-button kind="primary" size="sm" @click=${() => this.acceptItem(item, this.reconcileDraft)}>保存裁决（不改已播文本）</cds-button>
+                <cds-button kind="ghost" size="sm" @click=${this.cancelResolve}>取消</cds-button>
+              </div>
+            ` : html`
+              <div class="reconcile-actions">
+                ${item.status === 'conflict'
+                  ? html`<cds-button kind="primary" size="sm" @click=${() => this.beginResolve(item)}>人工裁决</cds-button>`
+                  : html`<cds-button kind="primary" size="sm" @click=${() => this.acceptItem(item)}>接受建议</cds-button>`}
+                ${item.status !== 'clean' ? html`<cds-button kind="ghost" size="sm" @click=${() => this.beginResolve(item)}>编辑后接受</cds-button>` : nothing}
+              </div>
+            `}
+          `}
+      </div>
+    `;
+  }
+
+  private renderPlayback() {
+    const confirmed = this.model.segments
+      .filter((segment) => segment.state === 'confirmed')
+      .sort((a, b) => a.startTime - b.startTime);
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>直播区与回放</h3>
+          <span>${confirmed.length} 段</span>
+        </div>
+        <div class="playback-bar">
+          <small>取字幕依据</small>
+          <cds-dropdown size="sm" value=${this.playbackMode} @cds-dropdown-selected=${(event: CustomEvent<{ item: { value: string } }>) => { this.playbackMode = event.detail.item.value; }} style="width: 150px;">
+            <cds-dropdown-item value="aired">各段确认版本（播出）</cds-dropdown-item>
+            ${this.packages.map((pkg) => html`<cds-dropdown-item value=${pkg.version}>按 v${pkg.version} 回放</cds-dropdown-item>`)}
+          </cds-dropdown>
+        </div>
+        <div class="playback-list">
+          ${confirmed.length ? confirmed.map((segment) => {
+            const view = this.playbackMode === 'aired'
+              ? { text: segment.reconciled?.text ?? segment.corrected, version: segment.reconciled?.version ?? segment.term?.version ?? this.model.activeTermVersion, conflict: false, reconciled: Boolean(segment.reconciled) }
+              : this.targetView(segment);
+            return html`
+              <article class="playback-item ${view.conflict ? 'conflict' : ''}">
+                <time>${formatClock(segment.startTime)} · ${segment.speaker}<span class="ver">v${view.version}${view.reconciled ? '（已对账）' : ''}</span></time>
+                ${view.text}
+                ${view.conflict ? html`<div class="reconcile-msg" style="color:#a2191f;">规则与人工修改冲突，已保留人工播出文本</div>` : nothing}
+              </article>
+            `;
+          }) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
+        </div>
+        <div class="import-actions">
+          <cds-button kind="tertiary" size="sm" @click=${() => this.exportSrt('aired')}>导出播出确认版</cds-button>
+          ${this.playbackMode !== 'aired' ? html`<cds-button kind="tertiary" size="sm" @click=${() => this.exportSrt(this.playbackMode)}>导出 v${this.playbackMode} 回放版</cds-button>` : nothing}
+        </div>
+        ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
+      </section>
+    `;
+  }
+
+  private targetView(segment: CaptionSegment) {
+    const mode = this.playbackMode;
+    if (segment.reconciled?.version === mode) {
+      return { text: segment.reconciled.text, version: mode, conflict: false, reconciled: true };
+    }
+    const item = reconciliationReport(this.model, mode).find((report) => report.segment.id === segment.id);
+    return {
+      text: item?.proposed ?? segment.corrected,
+      version: mode,
+      conflict: item?.status === 'conflict',
+      reconciled: false,
+    };
+  }
+
+  private renderLocalRules() {
+    const packageRules = this.activePackage?.rules ?? [];
+    const localRules = this.model.rules;
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>术语规则</h3>
+          <span>${packageRules.length} 条术语包 · ${localRules.filter((rule) => rule.enabled).length} 条本机</span>
+        </div>
+        <div class="rule-list">
+          ${packageRules.map((rule) => html`
+            <div class="rule-item">
+              <div>
+                <strong>${rule.source} → ${rule.replacement}</strong>
+                <p>${rule.speaker || '全部发言人'} · <b style="color:#0f62fe;">术语包 v${this.activePackage?.version} 只读</b></p>
+              </div>
+              <div class="rule-item-actions">
+                <cds-button kind="ghost" size="sm" @click=${() => this.applyTerm(rule.id)}>应用</cds-button>
+              </div>
+            </div>
+          `)}
+          ${localRules.map((rule) => html`
+            <div class="rule-item">
+              <div>
+                <strong>${rule.source} → ${rule.replacement}</strong>
+                <p>${rule.speaker || '全部发言人'} · 本机叠加 · 已使用 ${rule.usageCount} 次</p>
+              </div>
+              <div class="rule-item-actions">
+                <cds-button kind="ghost" size="sm" @click=${() => this.applyTerm(rule.id)}>应用</cds-button>
+                <cds-button kind="danger--ghost" size="xs" @click=${() => this.deleteRule(rule.id)}>删除</cds-button>
+              </div>
+            </div>
+          `)}
+        </div>
+        ${this.showRuleForm ? html`
+          <div class="rule-form">
+            <cds-text-input label-text="原文" .value=${this.ruleSource} @input=${(event: Event) => { this.ruleSource = (event.currentTarget as any).value; }}></cds-text-input>
+            <cds-text-input label-text="替换为" .value=${this.ruleReplacement} @input=${(event: Event) => { this.ruleReplacement = (event.currentTarget as any).value; }}></cds-text-input>
+            <cds-text-input class="full" label-text="仅对某发言人应用（可空）" .value=${this.ruleSpeaker} @input=${(event: Event) => { this.ruleSpeaker = (event.currentTarget as any).value; }}></cds-text-input>
+            <cds-button class="full" size="sm" kind="primary" @click=${this.addRule}>保存本机规则</cds-button>
+          </div>
+        ` : html`
+          <div style="padding: 10px;"><cds-button kind="tertiary" size="sm" @click=${() => { this.showRuleForm = true; }}>＋ 新增本机快捷规则</cds-button></div>
+        `}
+      </section>
+    `;
+  }
+
+  private renderContext() {
     const item = this.selected;
-    const confirmed = this.model.segments.filter((segment) => segment.state === 'confirmed').sort((a, b) => a.startTime - b.startTime);
+    return html`
+      <section class="inspector-section">
+        <div class="inspector-section-head">
+          <h3>当前片段上下文</h3>
+          <span>${item ? `#${item.sequence}` : '未选择'}</span>
+        </div>
+        <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
+          ${item ? html`
+            <div><strong>原始字幕：</strong>${item.original}</div>
+            <div style="margin-top: 8px;"><strong>确认版本：</strong>${item.term ? html`v${item.term.version}${item.term.manual ? ' · 含人工修改' : ' · 纯规则'}` : '未确认（确认时锁定当前版本）'}</div>
+            <div style="margin-top: 8px;"><strong>播出文本：</strong>${item.corrected}</div>
+            ${item.reconciled ? html`
+              <div style="margin-top: 8px; color: #0043ce;"><strong>对账记录：</strong>v${item.reconciled.fromVersion} → v${item.reconciled.version}${item.reconciled.note ? ` · ${item.reconciled.note}` : ''}</div>
+            ` : nothing}
+          ` : html`<span>请选择片段以查看上下文。</span>`}
+        </div>
+      </section>
+    `;
+  }
+
+  private renderInspector() {
     return html`
       <div class="inspector">
-        <section class="inspector-section">
-          <div class="inspector-section-head">
-            <h3>术语快捷规则</h3>
-            <span>${this.model.rules.filter((rule) => rule.enabled).length} 条启用</span>
-          </div>
-          <div class="rule-list">
-            ${this.model.rules.map((rule) => html`
-              <div class="rule-item">
-                <div>
-                  <strong>${rule.source} → ${rule.replacement}</strong>
-                  <p>${rule.speaker || '全部发言人'} · 已使用 ${rule.usageCount} 次</p>
-                </div>
-                <div class="rule-item-actions">
-                  <cds-button kind="ghost" size="sm" @click=${() => this.applyTerm(rule.id)}>应用</cds-button>
-                  <cds-button kind="danger--ghost" size="xs" @click=${() => this.deleteRule(rule.id)}>删除</cds-button>
-                </div>
-              </div>
-            `)}
-          </div>
-          ${this.showRuleForm ? html`
-            <div class="rule-form">
-              <cds-text-input label-text="原文" .value=${this.ruleSource} @input=${(event: Event) => { this.ruleSource = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-text-input label-text="替换为" .value=${this.ruleReplacement} @input=${(event: Event) => { this.ruleReplacement = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-text-input class="full" label-text="仅对某发言人应用（可空）" .value=${this.ruleSpeaker} @input=${(event: Event) => { this.ruleSpeaker = (event.currentTarget as any).value; }}></cds-text-input>
-              <cds-button class="full" size="sm" kind="primary" @click=${this.addRule}>保存规则</cds-button>
-            </div>
-          ` : html`
-            <div style="padding: 10px;"><cds-button kind="tertiary" size="sm" @click=${() => { this.showRuleForm = true; }}>＋ 新增术语规则</cds-button></div>
-          `}
-        </section>
-
-        <section class="inspector-section">
-          <div class="inspector-section-head">
-            <h3>直播区时间线</h3>
-            <span>${confirmed.length} 段已确认</span>
-          </div>
-          <div class="live-timeline">
-            ${confirmed.length ? confirmed.slice(-12).reverse().map((segment) => html`
-              <article class="live-item">
-                <time>${formatClock(segment.startTime)} · ${segment.speaker}</time>
-                <p>${segment.corrected}</p>
-                ${segment.source === 'offline' ? html`<small>离线来源 · 恢复后合并</small>` : nothing}
-              </article>
-            `) : html`<div class="empty"><strong>直播区等待内容</strong><p>确认一块字幕后，它会从这里进入实时输出。</p></div>`}
-          </div>
-          ${this.stats.offline > 0 ? html`<div class="delivery-status">离线发件箱有 ${this.stats.offline} 段待合并。恢复连接后按时间顺序提交，不会覆盖已确认内容。</div>` : nothing}
-        </section>
-
-        <section class="inspector-section">
-          <div class="inspector-section-head">
-            <h3>当前片段上下文</h3>
-            <span>${item ? `#${item.sequence}` : '未选择'}</span>
-          </div>
-          <div style="padding: 12px; line-height: 1.5; font-size: 11px;">
-            ${item ? html`
-              <div><strong>原始字幕：</strong>${item.original}</div>
-              <div style="margin-top: 8px;"><strong>修改前校正：</strong>${item.corrected}</div>
-              <div style="margin-top: 8px; color: var(--cds-text-secondary);">${item.tags.length ? `标签：${item.tags.join('、')}` : '尚未应用术语标签'}</div>
-            ` : html`<span>请选择片段以查看上下文。</span>`}
-          </div>
-        </section>
+        ${this.renderTermVersions()}
+        ${this.renderReconciliation()}
+        ${this.renderPlayback()}
+        ${this.renderLocalRules()}
+        ${this.renderContext()}
       </div>
     `;
   }
@@ -787,7 +1277,7 @@ export class CaptionDesk extends LitElement {
             <cds-button kind="ghost" size="sm" @click=${this.toggleTheme}>${this.dark ? '浅色界面' : '深色值守'}</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.undo}>撤销</cds-button>
             <cds-button kind="ghost" size="sm" @click=${this.redo}>重做</cds-button>
-            <cds-button kind="primary" size="sm" @click=${this.exportSrt}>导出 SRT</cds-button>
+            <cds-button kind="primary" size="sm" @click=${() => this.exportSrt('aired')}>导出播出版 SRT</cds-button>
           </div>
         </header>
 
@@ -839,8 +1329,8 @@ export class CaptionDesk extends LitElement {
           <section class="column">
             <div class="column-head">
               <div>
-                <h2>规则与直播区</h2>
-                <p>确认后进入直播输出；离线内容恢复后统一合并</p>
+                <h2>版本对账与直播区</h2>
+                <p>术语包只提供规则事实；每段确认时锁定版本，已播内容不被改写</p>
               </div>
               ${this.model.connection === 'offline'
                 ? html`<cds-button kind="primary" size="sm" @click=${this.mergeOffline}>恢复并合并</cds-button>`
